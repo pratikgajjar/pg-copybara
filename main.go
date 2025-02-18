@@ -17,6 +17,7 @@ import (
 
 	pg "github.com/jackc/pgx"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -109,7 +110,7 @@ func createPool(ctx context.Context, connStr string, maxConns int) *pgxpool.Pool
 }
 
 func worker(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Pool,
-	sourceTable, destTable string, columns []string,
+	sourceTable, destTable string, columns []pgconn.FieldDescription,
 	batches <-chan [2]int64, totalRows *atomic.Uint64) {
 
 	defer wg.Done()
@@ -128,7 +129,7 @@ func worker(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Pool,
 }
 
 func copyBatch(ctx context.Context, pool *pgxpool.Pool, sourceTable, destTable string,
-	columns []string, start, end int64, totalRows *atomic.Uint64) {
+	columns []pgconn.FieldDescription, start, end int64, totalRows *atomic.Uint64) {
 
 	const maxRetries = 1
 	var count int64
@@ -160,72 +161,66 @@ func copyBatch(ctx context.Context, pool *pgxpool.Pool, sourceTable, destTable s
 }
 
 func attemptCopy(ctx context.Context, pool *pgxpool.Pool, sourceTable, destTable string,
-	columns []string, start, end int64) (int64, error) {
+	columns []pgconn.FieldDescription, start, end int64) (int64, error) {
 
-	rxConn, err := pool.Acquire(ctx)
-	txConn, err := pool.Acquire(ctx)
+	rconn, err := pool.Acquire(ctx)
+	wconn, err := pool.Acquire(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("connection acquisition failed: %w", err)
 	}
-	defer rxConn.Release()
-	defer txConn.Release()
+	defer rconn.Release()
+	defer wconn.Release()
 
-	// Validate connection before use
-	if err := rxConn.Ping(ctx); err != nil {
-		return 0, fmt.Errorf("connection ping failed: %w", err)
-	}
-
-	rTx, err := rxConn.BeginTx(ctx, pgx.TxOptions{
+	tx, err := rconn.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.ReadCommitted,
 		AccessMode: pgx.ReadOnly,
+	})
+
+	wx, err := wconn.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.ReadCommitted,
+		AccessMode: pgx.ReadWrite,
 	})
 
 	if err != nil {
 		return 0, fmt.Errorf("transaction start failed: %w", err)
 	}
 
-	// Use cursor with hold for better large batch handling
-	cursorId := fmt.Sprintf("%s_cursor_%d_%d", sourceTable, start, end)
-	cursorStmt := fmt.Sprintf("DECLARE %s CURSOR FOR SELECT * FROM %s WHERE id BETWEEN %d and %d", cursorId, sourceTable, start, end)
-	_, err = rTx.Exec(ctx, cursorStmt)
+	// Declare a binary cursor for the selected rows
+	cursorName := fmt.Sprintf("copy_cursor_%d_%d", start, end)
+	_, err = tx.Exec(ctx,
+		fmt.Sprintf("DECLARE %s BINARY CURSOR FOR SELECT * FROM %s WHERE id BETWEEN $1 AND $2",
+			cursorName, sourceTable), start, end)
 	if err != nil {
 		return 0, fmt.Errorf("cursor creation failed: %w", err)
 	}
 
-	copyStmt := fmt.Sprintf("FETCH ALL FROM %s", cursorId)
-	rows, err := rTx.Query(ctx, copyStmt)
+	// Fetch all rows from the cursor
+	rows, err := tx.Query(ctx, fmt.Sprintf("FETCH ALL FROM %s", cursorName))
 	if err != nil {
 		return 0, fmt.Errorf("cursor fetch failed: %w", err)
 	}
 	defer rows.Close()
 
-	// Validate connection before use
-	if err := txConn.Ping(ctx); err != nil {
-		return 0, fmt.Errorf("connection ping failed: %w", err)
+	// Extract column names from the field descriptions
+	columnNames := make([]string, len(columns))
+	for i, fd := range columns {
+		columnNames[i] = string(fd.Name)
 	}
 
-	tTx, err := txConn.BeginTx(ctx, pgx.TxOptions{
-		IsoLevel:   pgx.ReadCommitted,
-		AccessMode: pgx.ReadWrite,
-	})
-
-	defer func() {
-		if err := tTx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
-			log.Printf("Rollback error: %v", err)
-		}
-	}()
-
-	copySource := NewRowsCopySource(rows)
-	count, err := tTx.CopyFrom(ctx, pgx.Identifier{destTable}, columns, copySource)
+	// Use pgx's CopyFrom with our RowsCopySource (which implements pgx.CopyFromSource)
+	copyCount, err := wx.CopyFrom(ctx, pgx.Identifier{destTable}, columnNames, NewRowsCopySource(rows))
 	if err != nil {
 		return 0, fmt.Errorf("copy failed: %w", err)
 	}
 
-	if err := tTx.Commit(ctx); err != nil {
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit failed: %w", err)
+	}
+	if err := wx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit failed: %w", err)
 	}
 
-	return count, nil
+	return copyCount, nil
 }
 
 func shouldDropConnection(err error) bool {
@@ -234,7 +229,8 @@ func shouldDropConnection(err error) bool {
 		strings.Contains(err.Error(), "connection reset")
 }
 
-func getTableColumns(pool *pgxpool.Pool, tableName string) ([]string, error) {
+// Modified to get OIDs and type information
+func getTableColumns(pool *pgxpool.Pool, tableName string) ([]pgconn.FieldDescription, error) {
 	conn, err := pool.Acquire(context.Background())
 	if err != nil {
 		return nil, err
@@ -247,12 +243,7 @@ func getTableColumns(pool *pgxpool.Pool, tableName string) ([]string, error) {
 	}
 	defer rows.Close()
 
-	var columns []string
-	for _, fd := range rows.FieldDescriptions() {
-		columns = append(columns, string(fd.Name))
-	}
-
-	return columns, nil
+	return rows.FieldDescriptions(), nil
 }
 
 func generateBatches(ctx context.Context, start, end, batchSize int64) <-chan [2]int64 {
