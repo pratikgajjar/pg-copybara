@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -160,6 +163,10 @@ func copyBatch(ctx context.Context, pool *pgxpool.Pool, sourceTable, destTable s
 	log.Printf("Batch %d-%d failed after %d attempts", start, end, maxRetries)
 }
 
+func quoteIdentifier(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
 func attemptCopy(ctx context.Context, pool *pgxpool.Pool, sourceTable, destTable string,
 	columns []pgconn.FieldDescription, start, end int64) (int64, error) {
 
@@ -206,9 +213,19 @@ func attemptCopy(ctx context.Context, pool *pgxpool.Pool, sourceTable, destTable
 	for i, fd := range columns {
 		columnNames[i] = string(fd.Name)
 	}
+	cbuf := &bytes.Buffer{}
+	for i, cn := range columnNames {
+		if i != 0 {
+			cbuf.WriteString(", ")
+		}
+		cbuf.WriteString(quoteIdentifier(cn))
+	}
+	quotedColumnNames := cbuf.String()
 
-	// Use pgx's CopyFrom with our RowsCopySource (which implements pgx.CopyFromSource)
-	copyCount, err := wx.CopyFrom(ctx, pgx.Identifier{destTable}, columnNames, NewRowsCopySource(rows))
+	wSql := fmt.Sprintf("copy %s ( %s ) from stdin binary;", destTable, quotedColumnNames)
+	copySource := NewRowsCopySource(rows)
+	commandTag, err := wx.Conn().PgConn().CopyFrom(ctx, copySource, wSql)
+	copyCount := commandTag.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("copy failed: %w", err)
 	}
@@ -291,10 +308,113 @@ type RowsCopySource struct {
 	ctx    context.Context
 	err    error
 	closed bool
+
+	buf            bytes.Buffer // internal buffer to accumulate data for Read()
+	headerWritten  bool         // true after the header has been written
+	trailerWritten bool         // true after the trailer has been written
+	io.Reader
 }
 
 func NewRowsCopySource(rows pgx.Rows) *RowsCopySource {
 	return &RowsCopySource{rows: rows}
+}
+
+func (r *RowsCopySource) RawValues() [][]byte {
+	return r.rows.RawValues()
+}
+
+func (r *RowsCopySource) Read(p []byte) (int, error) {
+	// If an error has occurred and there is no buffered data, report it.
+	if r.err != nil && r.buf.Len() == 0 {
+		return 0, r.err
+	}
+
+	// Continue filling our internal buffer until we have at least some data
+	// or until we have finished writing all parts (header, rows, trailer).
+	for r.buf.Len() < len(p) && !r.trailerWritten {
+		// Write the binary COPY header if not done yet.
+		// The header consists of:
+		//   - an 11-byte signature: "PGCOPY\n\xff\r\n\x00"
+		//   - 4 bytes of flags (0)
+		//   - 4 bytes of header extension length (0)
+		if !r.headerWritten {
+			header := []byte("PGCOPY\n\xff\r\n\x00")
+			var hdrBuf bytes.Buffer
+			hdrBuf.Write(header)
+			var flags [4]byte
+			binary.BigEndian.PutUint32(flags[:], 0)
+			hdrBuf.Write(flags[:])
+			var extLen [4]byte
+			binary.BigEndian.PutUint32(extLen[:], 0)
+			hdrBuf.Write(extLen[:])
+			r.buf.Write(hdrBuf.Bytes())
+			r.headerWritten = true
+			continue // now there is some header data in the buffer
+		}
+
+		// Try to fetch the next row.
+		if r.rows.Next() {
+			rawValues := r.rows.RawValues() // each element is already in binary form
+			var rowBuf bytes.Buffer
+
+			// Write the number of columns as int16 (big-endian)
+			if err := binary.Write(&rowBuf, binary.BigEndian, int16(len(rawValues))); err != nil {
+				r.err = err
+				break
+			}
+
+			// For each column, write:
+			//   - int32 length (or -1 if NULL)
+			//   - the raw bytes (if not NULL)
+			for _, val := range rawValues {
+				if val == nil {
+					if err := binary.Write(&rowBuf, binary.BigEndian, int32(-1)); err != nil {
+						r.err = err
+						break
+					}
+				} else {
+					if err := binary.Write(&rowBuf, binary.BigEndian, int32(len(val))); err != nil {
+						r.err = err
+						break
+					}
+					if _, err := rowBuf.Write(val); err != nil {
+						r.err = err
+						break
+					}
+				}
+			}
+			// Append the binary representation of this row to our buffer.
+			r.buf.Write(rowBuf.Bytes())
+		} else {
+			// If there’s an error from the underlying rows, capture it.
+			if err := r.rows.Err(); err != nil {
+				r.err = err
+				break
+			}
+			// No more rows; write the trailer.
+			// The trailer is a 16-bit integer with the value -1 (0xFFFF).
+			var trailer [2]byte
+			binary.BigEndian.PutUint16(trailer[:], 0xFFFF)
+			r.buf.Write(trailer[:])
+			r.trailerWritten = true
+			break
+		}
+	}
+
+	// Read from our internal buffer into p.
+	n, err := r.buf.Read(p)
+	// If we returned any bytes, do not report an error even if one exists.
+	if n > 0 {
+		return n, nil
+	}
+	if r.err != nil {
+		return n, r.err
+	}
+	// If we have finished writing (trailer has been written) and our buffer is empty, signal EOF.
+	if r.trailerWritten && r.buf.Len() == 0 {
+		return n, io.EOF
+	}
+	return n, err
 }
 
 func (rcs *RowsCopySource) Next() bool {
