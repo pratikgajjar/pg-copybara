@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -131,7 +130,7 @@ func worker(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Pool,
 func copyBatch(ctx context.Context, pool *pgxpool.Pool, sourceTable, copySQL string,
 	start, end int64, totalRows *atomic.Uint64) {
 
-	const maxRetries = 1
+	const maxRetries = 2
 	var count int64
 	var err error
 
@@ -149,7 +148,7 @@ func copyBatch(ctx context.Context, pool *pgxpool.Pool, sourceTable, copySQL str
 			pool.Reset()
 		}
 
-		sleepDuration := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+		sleepDuration := time.Duration(1<<attempt) * time.Second
 		log.Printf("Batch %d-%d failed (attempt %d): %v. Retrying in %v",
 			start, end, attempt, err, sleepDuration)
 		time.Sleep(sleepDuration)
