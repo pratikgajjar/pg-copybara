@@ -18,6 +18,7 @@ import (
 	"time"
 
 	pg "github.com/jackc/pgx"
+	pgtype "github.com/jackc/pgx/pgtype"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,19 +29,40 @@ var (
 	copyTrailer = []byte{0xff, 0xff}
 )
 
+// jobArgs bundles all the parameters needed for the job, including
+// both connection pools, source table, COPY SQL, and destination columns.
+type jobArgs struct {
+	srcPool     *pgxpool.Pool
+	destPool    *pgxpool.Pool
+	sourceTable string
+	copySQL     string
+	destColumns []pgconn.FieldDescription
+}
+
 func main() {
 	sourceTable := flag.String("source", "", "Source table name")
-	destTable := flag.String("dest", "", "Destination table name")
+	destTable := flag.String("dest", "", "Destination table name (if empty, defaults to source table)")
 	startPK := flag.Int64("start", 0, "Start primary key")
 	endPK := flag.Int64("end", 0, "End primary key")
 	batchSize := flag.Int64("batch", 1000, "Batch size")
 	concurrency := flag.Int("concurrency", 8, "Number of concurrent workers")
-	connStr := flag.String("conn", "", "PostgreSQL connection string")
+	sourceConnStr := flag.String("sourceConn", "", "PostgreSQL connection string for source")
+	destConnStr := flag.String("destConn", "", "PostgreSQL connection string for destination (if empty, defaults to source connection string)")
 	flag.Parse()
 
-	if *sourceTable == "" || *destTable == "" || *startPK >= *endPK || *connStr == "" {
+	if *sourceTable == "" || *startPK >= *endPK || *sourceConnStr == "" {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if *destTable == "" {
+		*destTable = *sourceTable
+		log.Println("destTable=", destTable)
+	}
+
+	if *destConnStr == "" {
+		*destConnStr = *sourceConnStr
+		log.Println("#WARN using destination db string same as source")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -53,19 +75,32 @@ func main() {
 		cancel()
 	}()
 
-	pool := createPool(ctx, *connStr, *concurrency)
-	defer pool.Close()
+	// Create connection pools for source and destination.
+	srcPool := createPool(ctx, *sourceConnStr, *concurrency)
+	defer srcPool.Close()
+	destPool := createPool(ctx, *destConnStr, *concurrency)
+	defer destPool.Close()
 
-	columns, err := getTableColumns(pool, *sourceTable)
+	// Retrieve destination table column definitions (used for COPY and type conversion).
+	destColumns, err := getTableColumns(destPool, *destTable)
 	if err != nil {
-		log.Fatalf("Failed to get columns: %v", err)
+		log.Fatalf("Failed to get destination columns: %v", err)
 	}
 
-	quotedColumns := generateQuotedColumns(columns)
+	quotedColumns := generateQuotedColumns(destColumns)
 	copySQL := fmt.Sprintf("COPY %s (%s) FROM STDIN BINARY", *destTable, quotedColumns)
 	log.Println(copySQL)
 
 	batches := generateBatches(ctx, *startPK, *endPK, *batchSize)
+
+	// Bundle all configuration parameters (including pools) into jobArgs.
+	args := &jobArgs{
+		srcPool:     srcPool,
+		destPool:    destPool,
+		sourceTable: *sourceTable,
+		copySQL:     copySQL,
+		destColumns: destColumns,
+	}
 
 	var wg sync.WaitGroup
 	var totalRows atomic.Uint64
@@ -73,7 +108,7 @@ func main() {
 
 	for i := 0; i < *concurrency; i++ {
 		wg.Add(1)
-		go worker(ctx, &wg, pool, *sourceTable, copySQL, batches, &totalRows)
+		go worker(ctx, &wg, batches, &totalRows, args)
 	}
 
 	go reportProgress(ctx, &totalRows, startTime)
@@ -89,7 +124,7 @@ func createPool(ctx context.Context, connStr string, maxConns int) *pgxpool.Pool
 		log.Fatal(err)
 	}
 
-	config.MaxConns = int32(maxConns) * 2
+	config.MaxConns = int32(maxConns)
 	config.MinConns = int32(maxConns)
 	config.HealthCheckPeriod = 30 * time.Second
 	config.MaxConnLifetime = 60 * time.Minute
@@ -109,9 +144,7 @@ func createPool(ctx context.Context, connStr string, maxConns int) *pgxpool.Pool
 	return pool
 }
 
-func worker(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Pool,
-	sourceTable, copySQL string, batches <-chan [2]int64, totalRows *atomic.Uint64) {
-
+func worker(ctx context.Context, wg *sync.WaitGroup, batches <-chan [2]int64, totalRows *atomic.Uint64, args *jobArgs) {
 	defer wg.Done()
 
 	for {
@@ -120,23 +153,26 @@ func worker(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Pool,
 			if !ok {
 				return
 			}
-			copyBatch(ctx, pool, sourceTable, copySQL, batch[0], batch[1], totalRows)
+			// Process the batch range with adaptive subdivision.
+			copyBatch(ctx, batch[0], batch[1], totalRows, args)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func copyBatch(ctx context.Context, pool *pgxpool.Pool, sourceTable, copySQL string,
-	start, end int64, totalRows *atomic.Uint64) {
-
-	const maxRetries = 2
+// copyBatch attempts to copy rows in the range [start, end].
+// If the operation fails after maxRetries, it subdivides the range
+// (reducing its size by a factor of 10) and processes each subrange recursively.
+// For a single row (batch size of 1) that fails, the row is skipped.
+func copyBatch(ctx context.Context, start, end int64, totalRows *atomic.Uint64, args *jobArgs) {
+	const maxRetries = 1
 	var count int64
 	var err error
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		count, err = attemptCopy(attemptCtx, pool, sourceTable, copySQL, start, end)
+		count, err = attemptCopy(attemptCtx, start, end, args)
 		cancel()
 
 		if err == nil {
@@ -145,28 +181,51 @@ func copyBatch(ctx context.Context, pool *pgxpool.Pool, sourceTable, copySQL str
 		}
 
 		if shouldDropConnection(err) {
-			pool.Reset()
+			args.srcPool.Reset()
+			args.destPool.Reset()
 		}
 
-		sleepDuration := time.Duration(1<<attempt) * time.Second
-		log.Printf("Batch %d-%d failed (attempt %d): %v. Retrying in %v",
-			start, end, attempt, err, sleepDuration)
-		time.Sleep(sleepDuration)
+		if maxRetries > 1 {
+			sleepDuration := time.Duration(1<<attempt) * time.Second
+			log.Printf("Batch %d-%d failed (attempt %d): %v. Retrying in %v", start, end, attempt, err, sleepDuration)
+			time.Sleep(sleepDuration)
+		}
 	}
 
-	log.Printf("Batch %d-%d failed after %d attempts", start, end, maxRetries)
+	// If we've reached here, the copy failed after maxRetries.
+	batchSize := end - start + 1
+	if batchSize == 1 {
+		log.Printf("Single row %d failed, skipping: %v", start, err)
+		return
+	}
+
+	newBatchSize := batchSize / 10
+	if newBatchSize < 1 {
+		newBatchSize = 1
+	}
+	log.Printf("Dividing batch %d-%d (size %d) into smaller batches of size %d due to errors: %v",
+		start, end, batchSize, newBatchSize, err)
+
+	// Recursively process sub-batches.
+	for subStart := start; subStart <= end; subStart += newBatchSize {
+		subEnd := subStart + newBatchSize - 1
+		if subEnd > end {
+			subEnd = end
+		}
+		copyBatch(ctx, subStart, subEnd, totalRows, args)
+	}
 }
 
-func attemptCopy(ctx context.Context, pool *pgxpool.Pool, sourceTable, copySQL string,
-	start, end int64) (int64, error) {
-
-	rconn, err := pool.Acquire(ctx)
+func attemptCopy(ctx context.Context, start, end int64, args *jobArgs) (int64, error) {
+	// Acquire a read connection from the source pool.
+	rconn, err := args.srcPool.Acquire(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("acquire read connection failed: %w", err)
 	}
 	defer rconn.Release()
 
-	wconn, err := pool.Acquire(ctx)
+	// Acquire a write connection from the destination pool.
+	wconn, err := args.destPool.Acquire(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("acquire write connection failed: %w", err)
 	}
@@ -179,7 +238,8 @@ func attemptCopy(ctx context.Context, pool *pgxpool.Pool, sourceTable, copySQL s
 	defer tx.Rollback(ctx)
 
 	cursorName := fmt.Sprintf("copy_cursor_%d_%d", start, end)
-	_, err = tx.Exec(ctx, fmt.Sprintf("DECLARE %s BINARY CURSOR FOR SELECT * FROM %s WHERE id BETWEEN $1 AND $2", cursorName, sourceTable), start, end)
+	_, err = tx.Exec(ctx, fmt.Sprintf("DECLARE %s BINARY CURSOR FOR SELECT * FROM %s WHERE id BETWEEN $1 AND $2",
+		cursorName, args.sourceTable), start, end)
 	if err != nil {
 		return 0, fmt.Errorf("declare cursor failed: %w", err)
 	}
@@ -196,8 +256,9 @@ func attemptCopy(ctx context.Context, pool *pgxpool.Pool, sourceTable, copySQL s
 	}
 	defer wtx.Rollback(ctx)
 
-	copySource := NewRowsCopySource(rows)
-	cmdTag, err := wtx.Conn().PgConn().CopyFrom(ctx, copySource, copySQL)
+	// Pass the destination columns to the copy source.
+	copySource := NewRowsCopySource(rows, args.destColumns)
+	cmdTag, err := wtx.Conn().PgConn().CopyFrom(ctx, copySource, args.copySQL)
 	if err != nil {
 		return 0, fmt.Errorf("copy failed: %w", err)
 	}
@@ -280,6 +341,7 @@ func reportProgress(ctx context.Context, totalRows *atomic.Uint64, startTime tim
 	}
 }
 
+// RowsCopySource holds destination column definitions for type conversion.
 type RowsCopySource struct {
 	rows           pgx.Rows
 	headerWritten  bool
@@ -288,10 +350,14 @@ type RowsCopySource struct {
 	closed         bool
 	buf            bytes.Buffer
 	rowBuf         bytes.Buffer
+	destColumns    []pgconn.FieldDescription
 }
 
-func NewRowsCopySource(rows pgx.Rows) *RowsCopySource {
-	return &RowsCopySource{rows: rows}
+func NewRowsCopySource(rows pgx.Rows, destColumns []pgconn.FieldDescription) *RowsCopySource {
+	return &RowsCopySource{
+		rows:        rows,
+		destColumns: destColumns,
+	}
 }
 
 func (r *RowsCopySource) Read(p []byte) (int, error) {
@@ -314,10 +380,15 @@ func (r *RowsCopySource) Read(p []byte) (int, error) {
 			binary.BigEndian.PutUint16(numCols[:], uint16(len(rawValues)))
 			r.rowBuf.Write(numCols[:])
 
-			for _, val := range rawValues {
+			for i, val := range rawValues {
 				if val == nil {
 					r.rowBuf.Write([]byte{0xff, 0xff, 0xff, 0xff})
 				} else {
+					// Use destination column info for type conversion.
+					if r.destColumns[i].DataTypeOID == pgtype.JSONBOID {
+						val = append([]byte{1}, val...) // Add JSONB versioning byte.
+					}
+					// Additional type-specific logic can be added here.
 					lenBytes := make([]byte, 4)
 					binary.BigEndian.PutUint32(lenBytes, uint32(len(val)))
 					r.rowBuf.Write(lenBytes)
