@@ -18,9 +18,9 @@ import (
 	"time"
 
 	pg "github.com/jackc/pgx"
-	pgtype "github.com/jackc/pgx/pgtype"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	pgtype "github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -385,10 +385,20 @@ func (r *RowsCopySource) Read(p []byte) (int, error) {
 					r.rowBuf.Write([]byte{0xff, 0xff, 0xff, 0xff})
 				} else {
 					// Use destination column info for type conversion.
-					if r.destColumns[i].DataTypeOID == pgtype.JSONBOID {
+					switch r.destColumns[i].DataTypeOID {
+					case pgtype.JSONBOID:
 						val = append([]byte{1}, val...) // Add JSONB versioning byte.
+						break
+					case pgtype.Int8OID:
+						if len(val) == 4 {
+							// Convert 4-byte INT to 8-byte BIGINT
+							v := int32(binary.BigEndian.Uint32(val))
+							var buf [8]byte
+							binary.BigEndian.PutUint64(buf[:], uint64(v))
+							val = buf[:]
+						}
+						break
 					}
-					// Additional type-specific logic can be added here.
 					lenBytes := make([]byte, 4)
 					binary.BigEndian.PutUint32(lenBytes, uint32(len(val)))
 					r.rowBuf.Write(lenBytes)
